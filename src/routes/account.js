@@ -1,0 +1,351 @@
+import { Router } from 'express';
+import crypto from 'node:crypto';
+import bcrypt from 'bcryptjs';
+import { prisma, toMajor } from '../db.js';
+import { STATUS_TEXT } from '../constants.js';
+import { asset, packImage } from './public.js';
+import { setCustomerSession, clearCustomerSession, requireCustomer, linkLimiter, loginLimiter, customerToken, isAppClient } from '../auth.js';
+import { customerLoginEmail, customerActivateEmail, newWholesaleAlert, appUrl } from '../mailer.js';
+
+// Customer accounts and dashboard. Customers register with a password (or use a one-time email link),
+// then see their orders, tracking and tracking history.
+const r = Router();
+const hash = t => crypto.createHash('sha256').update(t).digest('hex');
+const LINK_MINUTES = 20;
+
+// Send a sign-in link. Always answers the same way so nobody can probe which emails have ordered.
+r.post('/login-link', linkLimiter, async (req, res) => {
+  const email = String(req.body?.email || '').trim().toLowerCase();
+  if (!/^\S+@\S+\.\S+$/.test(email)) return res.status(400).json({ error: 'Please enter a valid email.' });
+
+  const customer = await prisma.customer.findUnique({ where: { email } });
+  if (customer) {
+    const token = crypto.randomBytes(32).toString('base64url');
+    await prisma.customerLoginToken.create({
+      data: { customerId: customer.id, tokenHash: hash(token), expiresAt: new Date(Date.now() + LINK_MINUTES * 60 * 1000) },
+    });
+    customerLoginEmail(customer, appUrl(`/account/verify?token=${token}`));
+  }
+  res.json({ ok: true });
+});
+
+// Exchange the link's token for a 30-day session cookie.
+r.post('/verify', async (req, res) => {
+  const token = String(req.body?.token || '');
+  const row = token && (await prisma.customerLoginToken.findUnique({ where: { tokenHash: hash(token) }, include: { customer: true } }));
+  if (!row || row.usedAt || row.expiresAt < new Date()) {
+    return res.status(400).json({ error: 'This sign-in link has expired or was already used. Please request a new one.' });
+  }
+  await prisma.customerLoginToken.update({ where: { id: row.id }, data: { usedAt: new Date() } });
+  // confirming the email also activates a password chosen at registration
+  const pending = row.customer.pendingPasswordHash;
+  await prisma.customer.update({
+    where: { id: row.customer.id },
+    data: { lastLoginAt: new Date(), ...(pending ? { passwordHash: pending, pendingPasswordHash: null } : {}) },
+  });
+  setCustomerSession(res, row.customer);
+  res.json({ ok: true, ...(isAppClient(req) ? { token: customerToken(row.customer) } : {}) });
+});
+
+const isEmail = v => /^\S+@\S+\.\S+$/.test(v);
+const clean = (v, max = 120) => String(v ?? '').trim().slice(0, max);
+const PASSWORD_MIN = 8;
+
+async function sendLink(customer, kind) {
+  const token = crypto.randomBytes(32).toString('base64url');
+  await prisma.customerLoginToken.create({
+    data: { customerId: customer.id, tokenHash: hash(token), expiresAt: new Date(Date.now() + LINK_MINUTES * 60 * 1000) },
+  });
+  const link = appUrl(`/account/verify?token=${token}`);
+  return kind === 'activate' ? customerActivateEmail(customer, link) : customerLoginEmail(customer, link);
+}
+
+// Create an account. If the email already has guest orders, we email a link to confirm it's theirs
+// before linking anything, so nobody can see another person's orders by registering with their email.
+r.post('/register', loginLimiter, async (req, res) => {
+  const b = req.body || {};
+  const email = clean(b.email).toLowerCase();
+  const errors = [];
+  if (!clean(b.name, 120)) errors.push('Your name is required.');
+  if (!isEmail(email)) errors.push('Enter a valid email address.');
+  if (clean(b.phone, 40).replace(/\D/g, '').length < 7) errors.push('Enter a phone or WhatsApp number.');
+  if (String(b.password || '').length < PASSWORD_MIN) errors.push(`Use a password of at least ${PASSWORD_MIN} characters.`);
+  const accountType = ['wholesale', 'international'].includes(b.accountType) ? b.accountType : 'individual';
+  const country = clean(b.country, 80) || (accountType === 'international' ? '' : 'Nigeria');
+  if (!country) errors.push('Country is required.');
+  if (accountType === 'international' && /^nigeria$/i.test(country)) errors.push('International accounts are for buyers outside Nigeria. Choose Individual or Wholesale instead.');
+  if (errors.length) return res.status(400).json({ errors });
+
+  const company = clean(b.company) || null;
+  const data = {
+    name: clean(b.name), phone: clean(b.phone, 40), company, country, accountType,
+    buyerType: accountType !== 'individual' || company ? 'business' : 'individual',
+    // wholesale accounts start pending until the admin approves them
+    wholesaleStatus: accountType === 'wholesale' ? 'pending' : 'none',
+  };
+  const existing = await prisma.customer.findUnique({ where: { email } });
+  if (existing?.passwordHash) return res.status(409).json({ error: 'An account with this email already exists. Please sign in.' });
+  if (existing) {
+    // guest customer: keep the password aside until they confirm the email
+    await prisma.customer.update({ where: { id: existing.id }, data: { ...data, pendingPasswordHash: await bcrypt.hash(String(b.password), 10) } });
+    await sendLink(existing, 'activate');
+    return res.status(202).json({ verify: true });
+  }
+  const customer = await prisma.customer.create({ data: { ...data, email, passwordHash: await bcrypt.hash(String(b.password), 10), lastLoginAt: new Date() } });
+  if (accountType === 'wholesale') newWholesaleAlert(customer);
+  setCustomerSession(res, customer);
+  res.status(201).json({ ok: true, ...(isAppClient(req) ? { token: customerToken(customer) } : {}) });
+});
+
+r.post('/login', loginLimiter, async (req, res) => {
+  const email = clean(req.body?.email).toLowerCase();
+  const customer = email && (await prisma.customer.findUnique({ where: { email } }));
+  const ok = customer?.passwordHash && (await bcrypt.compare(String(req.body?.password || ''), customer.passwordHash));
+  if (!ok) return res.status(401).json({ error: 'Wrong email or password. You can also sign in with an email link.' });
+  await prisma.customer.update({ where: { id: customer.id }, data: { lastLoginAt: new Date() } });
+  setCustomerSession(res, customer);
+  res.json({ ok: true, ...(isAppClient(req) ? { token: customerToken(customer) } : {}) });
+});
+
+r.post('/logout', (_req, res) => {
+  clearCustomerSession(res);
+  res.json({ ok: true });
+});
+
+r.use(requireCustomer);
+
+// Profile plus the delivery details from the latest order, used to pre-fill the next order form.
+r.get('/me', async (req, res) => {
+  const c = req.customer;
+  const last = await prisma.order.findFirst({ where: { customerId: c.id }, orderBy: { createdAt: 'desc' } });
+  res.json({
+    name: c.name,
+    email: c.email,
+    phone: c.phone,
+    company: c.company,
+    buyerType: c.buyerType,
+    country: c.country,
+    hasPassword: Boolean(c.passwordHash),
+    accountType: c.accountType,
+    wholesaleStatus: c.wholesaleStatus,
+    since: c.createdAt,
+    lastDelivery: last && {
+      type: last.deliveryType,
+      country: last.country,
+      state: last.state,
+      city: last.city,
+      address: last.address,
+      port: last.port,
+      shippingMethod: last.shippingMethod,
+      payment: last.paymentMethod,
+    },
+  });
+});
+
+const summary = o => ({
+  reference: o.reference,
+  status: o.status,
+  statusText: STATUS_TEXT[o.status],
+  createdAt: o.createdAt,
+  deliveryType: o.deliveryType,
+  destination: [o.city, o.state, o.country].filter(Boolean).join(', '),
+  currency: o.currency,
+  total: toMajor(o.total),
+  subtotal: toMajor(o.subtotal),
+  deliveryFee: toMajor(o.deliveryFee),
+  quoteNeeded: o.quoteNeeded,
+  paymentStatus: o.paymentStatus,
+  itemCount: o.items.reduce((s, i) => s + i.quantity, 0),
+  items: o.items.map(i => ({
+    name: i.productName, size: i.variantLabel, qty: i.quantity,
+    image: i.variant?.product ? asset(packImage(i.variant.product, i.variantLabel)) : null,
+    // for reorder / buy again; null when that pack size is no longer sold
+    productId: i.variant?.active && i.variant.product?.active ? i.variant.product.slug : null,
+    sizeId: i.variant?.active && i.variant.product?.active ? i.variant.code : null,
+  })),
+});
+
+r.get('/orders', async (req, res) => {
+  const orders = await prisma.order.findMany({
+    where: { customerId: req.customer.id },
+    orderBy: { createdAt: 'desc' },
+    include: { items: { include: { variant: { include: { product: true } } } } },
+  });
+  res.json(orders.map(summary));
+});
+
+r.get('/orders/:reference', async (req, res) => {
+  const o = await prisma.order.findFirst({
+    where: { reference: String(req.params.reference).toUpperCase(), customerId: req.customer.id },
+    include: {
+      items: { include: { variant: { include: { product: true } } } },
+      events: { where: { public: true }, orderBy: { createdAt: 'asc' } },
+    },
+  });
+  if (!o) return res.status(404).json({ error: 'Order not found.' });
+  res.json({
+    ...summary(o),
+    deliveryFee: toMajor(o.deliveryFee),
+    paymentMethod: o.paymentMethod,
+    paymentStatus: o.paymentStatus,
+    trackingNumber: o.trackingNumber,
+    port: o.port,
+    address: o.address,
+    notes: o.notes,
+    items: o.items.map(i => ({
+      name: i.productName,
+      size: i.variantLabel,
+      qty: i.quantity,
+      unitPrice: toMajor(i.unitPrice),
+      lineTotal: toMajor(i.lineTotal),
+      // used by "Reorder"; null when that pack size no longer exists
+      productId: i.variant?.active && i.variant.product.active ? i.variant.product.slug : null,
+      sizeId: i.variant?.active && i.variant.product.active ? i.variant.code : null,
+    })),
+    events: o.events.map(e => ({ status: e.status, note: e.note, at: e.createdAt })),
+  });
+});
+
+// Update name, phone and company.
+r.patch('/me', async (req, res) => {
+  const b = req.body || {};
+  const data = {};
+  if (b.name !== undefined) { data.name = clean(b.name); if (!data.name) return res.status(400).json({ error: 'Your name is required.' }); }
+  if (b.phone !== undefined) { data.phone = clean(b.phone, 40); if (data.phone.replace(/\D/g, '').length < 7) return res.status(400).json({ error: 'Enter a phone or WhatsApp number.' }); }
+  if (b.company !== undefined) data.company = clean(b.company) || null;
+  if (b.country !== undefined) data.country = clean(b.country, 80) || null;
+  const c = await prisma.customer.update({ where: { id: req.customer.id }, data });
+  res.json({ name: c.name, phone: c.phone, company: c.company, country: c.country });
+});
+
+// Set or change the password. Changing needs the current one; setting one for the first time doesn't
+// (the customer is already signed in through an email link).
+r.post('/password', async (req, res) => {
+  const { current = '', password = '' } = req.body || {};
+  if (String(password).length < PASSWORD_MIN) return res.status(400).json({ error: `Use a password of at least ${PASSWORD_MIN} characters.` });
+  if (req.customer.passwordHash && !(await bcrypt.compare(String(current), req.customer.passwordHash))) {
+    return res.status(400).json({ error: 'Your current password is not correct.' });
+  }
+  await prisma.customer.update({ where: { id: req.customer.id }, data: { passwordHash: await bcrypt.hash(String(password), 10), pendingPasswordHash: null } });
+  res.json({ ok: true });
+});
+
+// Tracking history: every public status update across the customer's orders, newest first.
+r.get('/activity', async (req, res) => {
+  const events = await prisma.orderStatusEvent.findMany({
+    where: { public: true, order: { customerId: req.customer.id } },
+    orderBy: { createdAt: 'desc' },
+    take: 200,
+    include: { order: { select: { reference: true, status: true, trackingNumber: true, city: true, country: true } } },
+  });
+  res.json(events.map(e => ({
+    id: e.id, status: e.status, note: e.note, at: e.createdAt,
+    reference: e.order.reference, currentStatus: e.order.status, trackingNumber: e.order.trackingNumber,
+    destination: [e.order.city, e.order.country].filter(Boolean).join(', '),
+  })));
+});
+
+/* ---------- saved addresses ---------- */
+function addressData(b = {}) {
+  const local = b.deliveryType === 'local';
+  const d = {
+    label: clean(b.label, 40) || 'Home',
+    deliveryType: local ? 'local' : 'international',
+    fullName: clean(b.fullName),
+    phone: clean(b.phone, 40),
+    country: local ? 'Nigeria' : clean(b.country, 80),
+    state: local ? clean(b.state, 80) : clean(b.state, 80) || null,
+    city: clean(b.city, 80),
+    address: clean(b.address, 300) || null,
+    port: local ? null : clean(b.port, 120) || null,
+    isDefault: Boolean(b.isDefault),
+  };
+  const errors = [];
+  if (!d.fullName) errors.push('Recipient name is required.');
+  if (d.phone.replace(/\D/g, '').length < 7) errors.push('A phone number is required.');
+  if (!d.city) errors.push('City is required.');
+  if (local) {
+    if (!d.state) errors.push('State is required.');
+    if (!d.address) errors.push('Street address is required.');
+  } else {
+    if (!d.country) errors.push('Country is required.');
+    if (!d.port) errors.push('Destination port or airport is required.');
+  }
+  return { d, errors };
+}
+
+r.get('/addresses', async (req, res) => {
+  res.json(await prisma.address.findMany({ where: { customerId: req.customer.id }, orderBy: [{ isDefault: 'desc' }, { createdAt: 'desc' }] }));
+});
+
+r.post('/addresses', async (req, res) => {
+  const { d, errors } = addressData(req.body);
+  if (errors.length) return res.status(400).json({ errors });
+  const count = await prisma.address.count({ where: { customerId: req.customer.id } });
+  if (count >= 20) return res.status(400).json({ errors: ['You can save up to 20 addresses.'] });
+  if (d.isDefault || count === 0) {
+    d.isDefault = true;
+    await prisma.address.updateMany({ where: { customerId: req.customer.id }, data: { isDefault: false } });
+  }
+  res.status(201).json(await prisma.address.create({ data: { ...d, customerId: req.customer.id } }));
+});
+
+r.patch('/addresses/:id', async (req, res) => {
+  const existing = await prisma.address.findFirst({ where: { id: req.params.id, customerId: req.customer.id } });
+  if (!existing) return res.status(404).json({ error: 'Address not found.' });
+  const { d, errors } = addressData({ ...existing, ...req.body });
+  if (errors.length) return res.status(400).json({ errors });
+  if (d.isDefault) await prisma.address.updateMany({ where: { customerId: req.customer.id }, data: { isDefault: false } });
+  res.json(await prisma.address.update({ where: { id: existing.id }, data: d }));
+});
+
+r.delete('/addresses/:id', async (req, res) => {
+  const existing = await prisma.address.findFirst({ where: { id: req.params.id, customerId: req.customer.id } });
+  if (!existing) return res.status(404).json({ error: 'Address not found.' });
+  await prisma.address.delete({ where: { id: existing.id } });
+  if (existing.isDefault) {
+    const next = await prisma.address.findFirst({ where: { customerId: req.customer.id }, orderBy: { createdAt: 'desc' } });
+    if (next) await prisma.address.update({ where: { id: next.id }, data: { isDefault: true } });
+  }
+  res.json({ ok: true });
+});
+
+// Ask for a wholesale account (from the dashboard). The admin approves or declines it.
+r.post('/wholesale-apply', async (req, res) => {
+  const c = req.customer;
+  if (c.wholesaleStatus === 'approved') return res.json({ wholesaleStatus: 'approved' });
+  const company = clean(req.body?.company) || c.company;
+  if (!company) return res.status(400).json({ error: 'Please enter your business or company name.' });
+  const updated = await prisma.customer.update({ where: { id: c.id }, data: { accountType: 'wholesale', wholesaleStatus: 'pending', company, buyerType: 'business' } });
+  newWholesaleAlert(updated, clean(req.body?.note, 600));
+  res.json({ wholesaleStatus: 'pending' });
+});
+
+/* ---------- wishlist ---------- */
+r.get('/wishlist', async (req, res) => {
+  const items = await prisma.wishlistItem.findMany({
+    where: { customerId: req.customer.id, product: { active: true } },
+    orderBy: { createdAt: 'desc' },
+    include: { product: true },
+  });
+  res.json(items.map(i => ({ productId: i.product.slug, addedAt: i.createdAt })));
+});
+
+r.post('/wishlist', async (req, res) => {
+  const product = await prisma.product.findFirst({ where: { slug: String(req.body?.productId || ''), active: true } });
+  if (!product) return res.status(404).json({ error: 'Product not found.' });
+  await prisma.wishlistItem.upsert({
+    where: { customerId_productId: { customerId: req.customer.id, productId: product.id } },
+    update: {},
+    create: { customerId: req.customer.id, productId: product.id },
+  });
+  res.status(201).json({ ok: true });
+});
+
+r.delete('/wishlist/:productId', async (req, res) => {
+  const product = await prisma.product.findUnique({ where: { slug: String(req.params.productId) } });
+  if (product) await prisma.wishlistItem.deleteMany({ where: { customerId: req.customer.id, productId: product.id } });
+  res.json({ ok: true });
+});
+
+export default r;
