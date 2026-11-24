@@ -50,6 +50,13 @@ r.post('/verify', async (req, res) => {
 const isEmail = v => /^\S+@\S+\.\S+$/.test(v);
 const clean = (v, max = 120) => String(v ?? '').trim().slice(0, max);
 const PASSWORD_MIN = 8;
+// Password rules (the sign-up form shows the same list): 8+ characters, with a letter and a number.
+function passwordProblem(pw) {
+  pw = String(pw || '');
+  if (pw.length < PASSWORD_MIN) return `Use a password of at least ${PASSWORD_MIN} characters.`;
+  if (!/[A-Za-z]/.test(pw) || !/\d/.test(pw)) return 'Your password needs at least one letter and one number.';
+  return null;
+}
 
 async function sendLink(customer, kind) {
   const token = crypto.randomBytes(32).toString('base64url');
@@ -69,11 +76,12 @@ r.post('/register', loginLimiter, async (req, res) => {
   if (!clean(b.name, 120)) errors.push('Your name is required.');
   if (!isEmail(email)) errors.push('Enter a valid email address.');
   if (clean(b.phone, 40).replace(/\D/g, '').length < 7) errors.push('Enter a phone or WhatsApp number.');
-  if (String(b.password || '').length < PASSWORD_MIN) errors.push(`Use a password of at least ${PASSWORD_MIN} characters.`);
+  const pwProblem = passwordProblem(b.password);
+  if (pwProblem) errors.push(pwProblem);
   const accountType = ['wholesale', 'international'].includes(b.accountType) ? b.accountType : 'individual';
   const country = clean(b.country, 80) || (accountType === 'international' ? '' : 'Nigeria');
   if (!country) errors.push('Country is required.');
-  if (accountType === 'international' && /^nigeria$/i.test(country)) errors.push('International accounts are for buyers outside Nigeria. Choose Individual or Wholesale instead.');
+  if (accountType === 'international' && /^nigeria$/i.test(country)) errors.push('International accounts are for buyers outside Nigeria. Choose Wholesale instead.');
   if (errors.length) return res.status(400).json({ errors });
 
   const company = clean(b.company) || null;
@@ -222,7 +230,8 @@ r.patch('/me', async (req, res) => {
 // (the customer is already signed in through an email link).
 r.post('/password', async (req, res) => {
   const { current = '', password = '' } = req.body || {};
-  if (String(password).length < PASSWORD_MIN) return res.status(400).json({ error: `Use a password of at least ${PASSWORD_MIN} characters.` });
+  const pwProblem = passwordProblem(password);
+  if (pwProblem) return res.status(400).json({ error: pwProblem });
   if (req.customer.passwordHash && !(await bcrypt.compare(String(current), req.customer.passwordHash))) {
     return res.status(400).json({ error: 'Your current password is not correct.' });
   }
