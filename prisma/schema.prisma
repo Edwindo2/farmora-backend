@@ -19,6 +19,7 @@ datasource db {
 model Product {
   id           String           @id @default(cuid()) @map("_id")
   wishlistedBy WishlistItem[]
+  savedPacks   SavedPack[]
   slug         String           @unique
   name         String
   tag          String
@@ -68,7 +69,18 @@ model Customer {
   wholesaleStatus     String               @default("none") // none | pending | approved | rejected (wholesale and distributor approval)
   area                String? // distributors: the states / areas they cover
   monthlyVolume       String? // distributors: expected monthly volume, in their words
+  avatarId            String? // StoredFile id of the profile photo
+  kycStatus           String? // none (missing) | pending | approved | rejected
+  kycIdType           String? // e.g. National ID (NIN), Passport, Driver's licence, CAC certificate
+  kycIdNumber         String?
+  kycDocId            String? // StoredFile id of the ID document
+  kycExtraId          String? // StoredFile id of an optional second document (proof of address / CAC)
+  kycNote             String? // admin's reason when rejected
+  kycSubmittedAt      DateTime?
+  kycReviewedAt       DateTime?
+  notices             CustomerNotice[]
   wishlist            WishlistItem[]
+  savedPacks          SavedPack[]
   lastLoginAt         DateTime?
   orders              Order[]
   messages            ContactMessage[]
@@ -102,15 +114,17 @@ model Order {
   quoteNeeded Boolean @default(false)
 
   // workflow
-  status         String    @default("received") // received | confirmed | paid | processing | shipped | delivered | cancelled
-  paymentMethod  String?
-  paymentStatus  String    @default("unpaid") // unpaid | paid | refunded
-  paymentRef     String? // Flutterwave transaction id when paid online
-  paidAt         DateTime?
-  trackingNumber String?
-  neededBy       DateTime?
-  notes          String? // from the customer
-  adminNotes     String? // internal only
+  status            String    @default("received") // received | confirmed | paid | processing | shipped | delivered | cancelled
+  paymentMethod     String?
+  paymentStatus     String    @default("unpaid") // unpaid | paid | refunded
+  paymentRef        String? // Flutterwave transaction id when paid online
+  paidAt            DateTime?
+  trackingNumber    String?
+  currentLocation   String? // where the goods are now, updated by admin
+  locationUpdatedAt DateTime?
+  neededBy          DateTime?
+  notes             String? // from the customer
+  adminNotes        String? // internal only
 
   items     OrderItem[]
   events    OrderStatusEvent[]
@@ -142,6 +156,7 @@ model OrderStatusEvent {
   orderId   String
   status    String
   note      String? // visible to the customer when public = true
+  location  String? // where the goods were at this update, if the admin set one
   public    Boolean  @default(true)
   createdBy String? // admin email, or "customer"
   createdAt DateTime @default(now())
@@ -280,4 +295,61 @@ model WishlistItem {
   createdAt  DateTime @default(now())
 
   @@unique([customerId, productId])
+}
+
+/// An uploaded file kept in the database (profile photos and KYC documents), so it survives redeploys.
+model StoredFile {
+  id         String   @id @default(cuid()) @map("_id")
+  customerId String?
+  kind       String // avatar | kyc
+  mime       String
+  size       Int
+  data       Bytes
+  createdAt  DateTime @default(now())
+
+  @@index([customerId])
+}
+
+/// A message the admin sent: to everyone, a group of customers, or one customer.
+model Broadcast {
+  id            String           @id @default(cuid()) @map("_id")
+  title         String
+  body          String
+  audience      String // all | wholesale | distributor | international | customer
+  audienceLabel String // shown in admin, e.g. "All customers" or "Jane Doe (jane@x.com)"
+  recipients    Int              @default(0)
+  emailed       Boolean          @default(false)
+  sentBy        String?
+  notices       CustomerNotice[]
+  createdAt     DateTime         @default(now())
+}
+
+/// One customer's copy of a message, shown in their dashboard notifications.
+model CustomerNotice {
+  id          String     @id @default(cuid()) @map("_id")
+  customer    Customer   @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  customerId  String
+  broadcast   Broadcast? @relation(fields: [broadcastId], references: [id], onDelete: Cascade)
+  broadcastId String?
+  title       String
+  body        String
+  link        String?
+  readAt      DateTime?
+  createdAt   DateTime   @default(now())
+
+  @@index([customerId])
+}
+
+/// A pack size a customer saved to their wishlist (e.g. Special Red Palm Oil, 4 litre pack).
+/// Replaces WishlistItem, which saved the whole product; old WishlistItem rows are still shown.
+model SavedPack {
+  id         String   @id @default(cuid()) @map("_id")
+  customer   Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  customerId String
+  product    Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+  productId  String
+  sizeCode   String // ProductVariant.code
+  createdAt  DateTime @default(now())
+
+  @@index([customerId])
 }

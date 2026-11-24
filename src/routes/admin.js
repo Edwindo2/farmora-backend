@@ -4,7 +4,8 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import bcrypt from 'bcryptjs';
 import crypto from 'node:crypto';
-import { passwordResetEmail, orderStatusEmail, wholesaleStatusEmail, adminUrl } from '../mailer.js';
+import { passwordResetEmail, orderStatusEmail, wholesaleStatusEmail, kycStatusEmail, noticeEmail, adminUrl } from '../mailer.js';
+import { sendFile, avatarUrl, kycStatusOf } from '../files.js';
 import { prisma, toMajor, toMinor } from '../db.js';
 import { requireAdmin, setSession, clearSession, loginLimiter } from '../auth.js';
 import { getSite, saveSite, getFx, saveFx, FX_CODES } from '../settings.js';
@@ -71,7 +72,8 @@ const pct = (now, before) => (before ? Math.round(((now - before) / before) * 10
 r.get('/stats', async (_req, res) => {
   const now = Date.now();
   const d30 = new Date(now - 30 * DAY), d60 = new Date(now - 60 * DAY);
-  const [pendingApplications, byStatus, newMessages, customers, paid, paid30, paidPrev, orders30, ordersPrev, recent, items, recentOrders, topRaw] = await Promise.all([
+  const [pendingKyc, pendingApplications, byStatus, newMessages, customers, paid, paid30, paidPrev, orders30, ordersPrev, recent, items, recentOrders, topRaw] = await Promise.all([
+    prisma.customer.count({ where: { kycStatus: 'pending' } }),
     prisma.customer.count({ where: { wholesaleStatus: 'pending' } }),
     prisma.order.groupBy({ by: ['status'], _count: true }),
     prisma.contactMessage.count({ where: { status: 'new' } }),
@@ -122,6 +124,7 @@ r.get('/stats', async (_req, res) => {
     newMessages,
     customers,
     pendingApplications,
+    pendingKyc,
     revenue: { NGN: sum(paid, 'NGN'), USD: sum(paid, 'USD') },
     trend: {
       NGN: pct(sum(paid30, 'NGN'), sum(paidPrev, 'NGN')),
@@ -139,18 +142,20 @@ r.get('/stats', async (_req, res) => {
 
 // Notifications + activity for the right-hand panel.
 r.get('/feed', async (_req, res) => {
-  const [orders, messages, events, customers, applications, payments] = await Promise.all([
+  const [orders, messages, events, customers, applications, payments, kyc] = await Promise.all([
     prisma.order.findMany({ orderBy: { createdAt: 'desc' }, take: 5, include: { customer: true } }),
     prisma.contactMessage.findMany({ orderBy: { createdAt: 'desc' }, take: 5 }),
     prisma.orderStatusEvent.findMany({ where: { createdBy: { not: 'customer' } }, orderBy: { createdAt: 'desc' }, take: 6, include: { order: { select: { reference: true } } } }),
     prisma.customer.findMany({ orderBy: { updatedAt: 'desc' }, take: 5 }),
     prisma.customer.findMany({ where: { wholesaleStatus: 'pending' }, orderBy: { createdAt: 'desc' }, take: 5 }),
     prisma.order.findMany({ where: { paymentStatus: 'paid', paidAt: { not: null } }, orderBy: { paidAt: 'desc' }, take: 5, include: { customer: true } }),
+    prisma.customer.findMany({ where: { kycStatus: 'pending' }, orderBy: { kycSubmittedAt: 'desc' }, take: 5 }),
   ]);
   const notifications = [
     ...orders.map(o => ({ type: 'order', text: `New order ${o.reference} from ${o.customer.name}`, link: `/orders/${o.reference}`, at: o.createdAt })),
     ...messages.map(m => ({ type: 'message', text: `${m.status === 'new' ? 'New message' : 'Message'} from ${m.name}: ${m.topic}`, link: '/messages', at: m.createdAt })),
     ...applications.map(c => ({ type: 'customers', text: `${c.accountType === 'distributor' ? 'Distributor' : 'Wholesale'} application from ${c.company || c.name}`, link: '/customers', at: c.createdAt, action: true })),
+    ...kyc.map(c => ({ type: 'kyc', text: `KYC documents from ${c.company || c.name} to review`, link: '/kyc', at: c.kycSubmittedAt, action: true })),
     ...payments.map(o => ({ type: 'wallet', text: `Payment received for ${o.reference} from ${o.customer.name}`, link: `/orders/${o.reference}`, at: o.paidAt })),
   ].sort((a, b) => b.at - a.at).slice(0, 8);
   res.json({
@@ -207,10 +212,11 @@ async function orderDetail(reference) {
     country: o.country, state: o.state, city: o.city, address: o.address, port: o.port, shippingMethod: o.shippingMethod,
     subtotal: toMajor(o.subtotal), deliveryFee: toMajor(o.deliveryFee), total: toMajor(o.total),
     paymentMethod: o.paymentMethod, trackingNumber: o.trackingNumber, neededBy: o.neededBy,
+    currentLocation: o.currentLocation, locationUpdatedAt: o.locationUpdatedAt,
     notes: o.notes, adminNotes: o.adminNotes,
     next: NEXT_STATUS[o.status],
     items: o.items.map(i => ({ id: i.id, name: i.productName, size: i.variantLabel, qty: i.quantity, unitPrice: toMajor(i.unitPrice), lineTotal: toMajor(i.lineTotal) })),
-    events: o.events.map(e => ({ status: e.status, note: e.note, public: e.public, by: e.createdBy, at: e.createdAt })),
+    events: o.events.map(e => ({ status: e.status, note: e.note, location: e.location, public: e.public, by: e.createdBy, at: e.createdAt })),
   };
 }
 
@@ -225,6 +231,10 @@ r.patch('/orders/:reference', async (req, res) => {
   const order = await prisma.order.findUnique({ where: { reference: req.params.reference }, include: { items: true } });
   if (!order) return res.status(404).json({ error: 'Order not found.' });
   const { status, note, notifyCustomer = true, deliveryFee, paymentStatus, trackingNumber, adminNotes, itemPrices } = req.body || {};
+  // where the goods are now (typed by admin until tracking is automated)
+  const location = req.body?.location !== undefined ? String(req.body.location).trim().slice(0, 160) : undefined;
+  const moved = location && location !== order.currentLocation;
+  if (moved) { data.currentLocation = location; data.locationUpdatedAt = new Date(); }
   const data = {};
 
   // admin can price "quote on request" lines: { [itemId]: unitPrice }
@@ -274,9 +284,10 @@ r.patch('/orders/:reference', async (req, res) => {
         if (v?.stock != null) await prisma.productVariant.update({ where: { id: v.id }, data: { stock: Math.max(0, v.stock + sign * it.quantity) } });
       }
     }
-  } else if (note && String(note).trim()) {
-    events.push({ status: order.status, note: String(note).trim(), public: Boolean(notifyCustomer), createdBy: req.admin.email });
+  } else if ((note && String(note).trim()) || moved) {
+    events.push({ status: order.status, note: String(note || '').trim() || `Your order is now at ${location}.`, public: moved ? true : Boolean(notifyCustomer), createdBy: req.admin.email });
   }
+  if (moved && events[0]) { events[0].location = location; if (data.status) events[0].public = true; }
 
   const updated = await prisma.order.update({ where: { id: order.id }, data: { ...data, events: { create: events } }, include: { customer: true } });
   const shared = events.find(e => e.public);
@@ -505,7 +516,7 @@ r.patch('/messages/:id', async (req, res) => {
 
 r.get('/customers', async (_req, res) => {
   const list = await prisma.customer.findMany({ orderBy: { createdAt: 'desc' }, take: 300, include: { _count: { select: { orders: true } } } });
-  res.json(list.map(c => ({ id: c.id, name: c.name, email: c.email, phone: c.phone, company: c.company, buyerType: c.buyerType, country: c.country, accountType: c.accountType, wholesaleStatus: c.wholesaleStatus, area: c.area, monthlyVolume: c.monthlyVolume, registered: Boolean(c.passwordHash), orders: c._count.orders, createdAt: c.createdAt })));
+  res.json(list.map(c => ({ id: c.id, name: c.name, email: c.email, phone: c.phone, company: c.company, buyerType: c.buyerType, country: c.country, accountType: c.accountType, wholesaleStatus: c.wholesaleStatus, area: c.area, monthlyVolume: c.monthlyVolume, avatarUrl: avatarUrl(c.avatarId), kycStatus: kycStatusOf(c), registered: Boolean(c.passwordHash), orders: c._count.orders, createdAt: c.createdAt })));
 });
 
 // Approve or decline a wholesale or distributor account. The customer is emailed either way.
@@ -522,6 +533,97 @@ r.patch('/customers/:id', async (req, res) => {
   });
   if (status === 'approved' || status === 'rejected') wholesaleStatusEmail(c, status);
   res.json({ id: c.id, wholesaleStatus: c.wholesaleStatus, accountType: c.accountType });
+});
+
+/* ---------- KYC review ---------- */
+// Documents stay stored after a decision, so they can be looked at again at any time.
+const kycRow = c => ({
+  id: c.id, name: c.name, email: c.email, phone: c.phone, company: c.company, accountType: c.accountType, country: c.country,
+  avatarUrl: avatarUrl(c.avatarId), status: kycStatusOf(c), idType: c.kycIdType, idNumber: c.kycIdNumber, note: c.kycNote,
+  submittedAt: c.kycSubmittedAt, reviewedAt: c.kycReviewedAt,
+  document: c.kycDocId ? `/api/admin/files/${c.kycDocId}` : null,
+  extra: c.kycExtraId ? `/api/admin/files/${c.kycExtraId}` : null,
+});
+r.get('/kyc', async (_req, res) => {
+  const list = await prisma.customer.findMany({ where: { kycStatus: { in: ['pending', 'approved', 'rejected'] } }, orderBy: { kycSubmittedAt: 'desc' }, take: 500 });
+  res.json(list.map(kycRow));
+});
+
+r.get('/files/:id', (req, res) => sendFile(res, req.params.id));
+
+r.patch('/kyc/:id', async (req, res) => {
+  const status = req.body?.status;
+  if (!['approved', 'rejected', 'pending'].includes(status)) return res.status(400).json({ error: 'Invalid status.' });
+  const note = String(req.body?.note || '').trim().slice(0, 500) || null;
+  if (status === 'rejected' && !note) return res.status(400).json({ error: 'Tell the customer why, so they can fix it.' });
+  const before = await prisma.customer.findUnique({ where: { id: req.params.id } });
+  if (!before?.kycDocId) return res.status(404).json({ error: 'No KYC documents for this customer.' });
+  const c = await prisma.customer.update({ where: { id: before.id }, data: { kycStatus: status, kycNote: status === 'rejected' ? note : null, kycReviewedAt: new Date() } });
+  if (status !== 'pending') {
+    kycStatusEmail(c, status, note);
+    await prisma.customerNotice.create({ data: {
+      customerId: c.id,
+      title: status === 'approved' ? 'Your account is verified' : 'Please re-upload your KYC documents',
+      body: status === 'approved' ? 'Your identity documents were checked and approved.' : `We could not verify your documents. ${note}`,
+      link: '/account?tab=kyc',
+    } });
+  }
+  res.json(kycRow(c));
+});
+
+/* ---------- messages to customers ---------- */
+const AUDIENCES = {
+  all: ['All customers', {}],
+  wholesale: ['Wholesale customers', { accountType: 'wholesale' }],
+  distributor: ['Distributors', { accountType: 'distributor' }],
+  international: ['International customers', { accountType: 'international' }],
+  verified: ['Verified (KYC approved)', { kycStatus: 'approved' }],
+};
+
+r.get('/broadcasts', async (_req, res) => {
+  const [list, customers] = await Promise.all([
+    prisma.broadcast.findMany({ orderBy: { createdAt: 'desc' }, take: 100, include: { _count: { select: { notices: { where: { readAt: { not: null } } } } } } }),
+    prisma.customer.findMany({ where: { passwordHash: { not: null } }, orderBy: { name: 'asc' }, select: { id: true, name: true, email: true, company: true, accountType: true } }),
+  ]);
+  const counts = {};
+  for (const k of Object.keys(AUDIENCES)) counts[k] = await prisma.customer.count({ where: { passwordHash: { not: null }, ...AUDIENCES[k][1] } });
+  res.json({
+    audiences: Object.entries(AUDIENCES).map(([id, [label]]) => ({ id, label, count: counts[id] })),
+    customers,
+    sent: list.map(b => ({ id: b.id, title: b.title, body: b.body, audience: b.audience, audienceLabel: b.audienceLabel, recipients: b.recipients, read: b._count.notices, emailed: b.emailed, sentBy: b.sentBy, at: b.createdAt })),
+  });
+});
+
+// Send to a group (audience) or to one customer (audience "customer" + customerId). Shows in their dashboard; optional email.
+r.post('/broadcasts', async (req, res) => {
+  const b = req.body || {};
+  const title = String(b.title || '').trim().slice(0, 120);
+  const body = String(b.body || '').trim().slice(0, 4000);
+  if (!title || !body) return res.status(400).json({ error: 'Add a title and a message.' });
+  let recipients, audienceLabel;
+  if (b.audience === 'customer') {
+    const c = b.customerId && (await prisma.customer.findUnique({ where: { id: String(b.customerId) } }));
+    if (!c) return res.status(400).json({ error: 'Choose a customer.' });
+    recipients = [c];
+    audienceLabel = `${c.name} (${c.email})`;
+  } else if (AUDIENCES[b.audience]) {
+    recipients = await prisma.customer.findMany({ where: { passwordHash: { not: null }, ...AUDIENCES[b.audience][1] } });
+    audienceLabel = AUDIENCES[b.audience][0];
+  } else return res.status(400).json({ error: 'Choose who to send to.' });
+  if (!recipients.length) return res.status(400).json({ error: 'No customers in that group yet.' });
+
+  const email = Boolean(b.email);
+  const sent = await prisma.broadcast.create({ data: { title, body, audience: b.audience, audienceLabel, recipients: recipients.length, emailed: email, sentBy: req.admin.email } });
+  await prisma.customerNotice.createMany({ data: recipients.map(c => ({ customerId: c.id, broadcastId: sent.id, title, body })) });
+  // emails go out one by one in the background so the request returns straight away
+  if (email) (async () => { for (const c of recipients) await noticeEmail(c, title, body); })();
+  res.status(201).json({ id: sent.id, recipients: recipients.length });
+});
+
+r.delete('/broadcasts/:id', async (req, res) => {
+  await prisma.customerNotice.deleteMany({ where: { broadcastId: req.params.id } });
+  await prisma.broadcast.delete({ where: { id: req.params.id } }).catch(() => null);
+  res.json({ ok: true });
 });
 
 /* ---------- display currencies ---------- */

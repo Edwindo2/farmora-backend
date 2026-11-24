@@ -156,3 +156,37 @@ export function wholesaleStatusEmail(customer, status) {
     button: { label: 'See my prices', href: appUrl('/shop') },
   });
 }
+
+export function kycSubmittedAlert(customer) {
+  return sendMail({
+    to: process.env.ADMIN_NOTIFY_EMAIL,
+    subject: `KYC documents from ${customer.company || customer.name}`,
+    heading: 'New KYC submission',
+    body: `<p><b>${esc(customer.name)}</b>${customer.company ? ` (${esc(customer.company)})` : ''}, ${esc(customer.email)} sent their ${esc(customer.kycIdType || 'ID')} for verification.</p>`,
+    button: { label: 'Review in admin', href: adminUrl('/kyc') },
+  });
+}
+
+export function kycStatusEmail(customer, status, note) {
+  const ok = status === 'approved';
+  const first = esc(customer.name.split(' ')[0]);
+  return sendMail({
+    to: customer.email,
+    subject: ok ? 'Your Farmora account is verified' : 'About your Farmora verification',
+    heading: ok ? 'You are verified.' : 'We need another look at your documents',
+    body: ok
+      ? `<p>Hi ${first}, your identity documents have been checked and your account is now verified.</p>`
+      : `<p>Hi ${first}, we could not verify the documents you sent.${note ? ` Reason: ${esc(note)}` : ''}</p><p>Please upload them again from your dashboard.</p>`,
+    button: { label: 'Open my dashboard', href: appUrl('/account?tab=kyc') },
+  });
+}
+
+export function noticeEmail(customer, title, body) {
+  return sendMail({
+    to: customer.email,
+    subject: title,
+    heading: title,
+    body: `<p>Hi ${esc(customer.name.split(' ')[0])},</p>${esc(body).split(/\n{2,}/).map(p => `<p>${p.replace(/\n/g, '<br>')}</p>`).join('')}`,
+    button: { label: 'Open my dashboard', href: appUrl('/account') },
+  });
+}

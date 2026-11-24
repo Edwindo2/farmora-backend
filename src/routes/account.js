@@ -6,7 +6,8 @@ import { STATUS_TEXT } from '../constants.js';
 import { asset, packImage } from './public.js';
 import { setCustomerSession, clearCustomerSession, requireCustomer, linkLimiter, loginLimiter, customerToken, isAppClient } from '../auth.js';
 import { canPay, createPaymentLink, confirmTransaction, paymentsEnabled } from '../flutterwave.js';
-import { customerLoginEmail, customerActivateEmail, newWholesaleAlert, appUrl } from '../mailer.js';
+import { customerLoginEmail, customerActivateEmail, newWholesaleAlert, kycSubmittedAlert, appUrl } from '../mailer.js';
+import { rawUpload, saveFile, removeFile, avatarUrl, IMAGE_TYPES, DOC_TYPES, KYC_ID_TYPES, kycStatusOf } from '../files.js';
 
 // Customer accounts and dashboard. Customers register with a password (or use a one-time email link),
 // then see their orders, tracking and tracking history.
@@ -141,6 +142,9 @@ r.get('/me', async (req, res) => {
     wholesaleStatus: c.wholesaleStatus,
     area: c.area,
     monthlyVolume: c.monthlyVolume,
+    avatarUrl: avatarUrl(c.avatarId),
+    kycStatus: kycStatusOf(c),
+    kycNote: c.kycNote,
     since: c.createdAt,
     lastDelivery: last && {
       type: last.deliveryType,
@@ -168,6 +172,9 @@ const summary = o => ({
   deliveryFee: toMajor(o.deliveryFee),
   quoteNeeded: o.quoteNeeded,
   paymentStatus: o.paymentStatus,
+  currentLocation: o.currentLocation,
+  locationUpdatedAt: o.locationUpdatedAt,
+  trackingNumber: o.trackingNumber,
   itemCount: o.items.reduce((s, i) => s + i.quantity, 0),
   items: o.items.map(i => ({
     name: i.productName, size: i.variantLabel, qty: i.quantity,
@@ -218,7 +225,7 @@ r.get('/orders/:reference', async (req, res) => {
       productId: i.variant?.active && i.variant.product.active ? i.variant.product.slug : null,
       sizeId: i.variant?.active && i.variant.product.active ? i.variant.code : null,
     })),
-    events: o.events.map(e => ({ status: e.status, note: e.note, at: e.createdAt })),
+    events: o.events.map(e => ({ status: e.status, note: e.note, location: e.location, at: e.createdAt })),
   });
 });
 
@@ -276,10 +283,10 @@ r.get('/activity', async (req, res) => {
     where: { public: true, order: { customerId: req.customer.id } },
     orderBy: { createdAt: 'desc' },
     take: 200,
-    include: { order: { select: { reference: true, status: true, trackingNumber: true, city: true, country: true } } },
+    include: { order: { select: { reference: true, status: true, trackingNumber: true, city: true, country: true, currentLocation: true } } },
   });
   res.json(events.map(e => ({
-    id: e.id, status: e.status, note: e.note, at: e.createdAt,
+    id: e.id, status: e.status, note: e.note, location: e.location, at: e.createdAt, currentLocation: e.order.currentLocation,
     reference: e.order.reference, currentStatus: e.order.status, trackingNumber: e.order.trackingNumber,
     destination: [e.order.city, e.order.country].filter(Boolean).join(', '),
   })));
@@ -362,29 +369,114 @@ r.post('/wholesale-apply', async (req, res) => {
 });
 
 /* ---------- wishlist ---------- */
+// Saved per pack size. Older entries saved the whole product; those come back with sizeId null.
 r.get('/wishlist', async (req, res) => {
-  const items = await prisma.wishlistItem.findMany({
-    where: { customerId: req.customer.id, product: { active: true } },
-    orderBy: { createdAt: 'desc' },
-    include: { product: true },
-  });
-  res.json(items.map(i => ({ productId: i.product.slug, addedAt: i.createdAt })));
+  const [packs, legacy] = await Promise.all([
+    prisma.savedPack.findMany({ where: { customerId: req.customer.id, product: { active: true } }, orderBy: { createdAt: 'desc' }, include: { product: true } }),
+    prisma.wishlistItem.findMany({ where: { customerId: req.customer.id, product: { active: true } }, orderBy: { createdAt: 'desc' }, include: { product: true } }),
+  ]);
+  res.json([
+    ...packs.map(i => ({ productId: i.product.slug, sizeId: i.sizeCode, addedAt: i.createdAt })),
+    ...legacy.map(i => ({ productId: i.product.slug, sizeId: null, addedAt: i.createdAt })),
+  ]);
 });
 
 r.post('/wishlist', async (req, res) => {
-  const product = await prisma.product.findFirst({ where: { slug: String(req.body?.productId || ''), active: true } });
+  const product = await prisma.product.findFirst({ where: { slug: String(req.body?.productId || ''), active: true }, include: { variants: true } });
   if (!product) return res.status(404).json({ error: 'Product not found.' });
-  await prisma.wishlistItem.upsert({
-    where: { customerId_productId: { customerId: req.customer.id, productId: product.id } },
-    update: {},
-    create: { customerId: req.customer.id, productId: product.id },
-  });
+  const sizeCode = req.body?.sizeId ? String(req.body.sizeId) : null;
+  if (sizeCode) {
+    if (!product.variants.some(v => v.code === sizeCode)) return res.status(404).json({ error: 'Pack size not found.' });
+    const found = await prisma.savedPack.findFirst({ where: { customerId: req.customer.id, productId: product.id, sizeCode } });
+    if (!found) await prisma.savedPack.create({ data: { customerId: req.customer.id, productId: product.id, sizeCode } });
+  } else {
+    await prisma.wishlistItem.upsert({
+      where: { customerId_productId: { customerId: req.customer.id, productId: product.id } },
+      update: {},
+      create: { customerId: req.customer.id, productId: product.id },
+    });
+  }
   res.status(201).json({ ok: true });
 });
 
+// DELETE /wishlist/:productId?size=code removes one pack size; without ?size it removes an old whole-product entry.
 r.delete('/wishlist/:productId', async (req, res) => {
   const product = await prisma.product.findUnique({ where: { slug: String(req.params.productId) } });
-  if (product) await prisma.wishlistItem.deleteMany({ where: { customerId: req.customer.id, productId: product.id } });
+  if (product) {
+    if (req.query.size) await prisma.savedPack.deleteMany({ where: { customerId: req.customer.id, productId: product.id, sizeCode: String(req.query.size) } });
+    else await prisma.wishlistItem.deleteMany({ where: { customerId: req.customer.id, productId: product.id } });
+  }
+  res.json({ ok: true });
+});
+
+/* ---------- profile photo ---------- */
+r.post('/avatar', rawUpload(IMAGE_TYPES, '3mb'), async (req, res) => {
+  const f = await saveFile(req, res, { kind: 'avatar', types: IMAGE_TYPES, customerId: req.customer.id, maxMb: 2 });
+  if (!f) return;
+  await prisma.customer.update({ where: { id: req.customer.id }, data: { avatarId: f.id } });
+  await removeFile(req.customer.avatarId);
+  res.status(201).json({ avatarUrl: avatarUrl(f.id) });
+});
+
+r.delete('/avatar', async (req, res) => {
+  await prisma.customer.update({ where: { id: req.customer.id }, data: { avatarId: null } });
+  await removeFile(req.customer.avatarId);
+  res.json({ avatarUrl: null });
+});
+
+/* ---------- KYC (identity verification) ---------- */
+const kycOut = c => ({
+  status: kycStatusOf(c), idType: c.kycIdType, idNumber: c.kycIdNumber, note: c.kycNote,
+  hasDocument: Boolean(c.kycDocId), hasExtra: Boolean(c.kycExtraId),
+  submittedAt: c.kycSubmittedAt, reviewedAt: c.kycReviewedAt, idTypes: KYC_ID_TYPES,
+});
+r.get('/kyc', (req, res) => res.json(kycOut(req.customer)));
+
+// Step 1: upload each document; returns its id. Step 2: submit the form with those ids.
+r.post('/kyc/files', rawUpload(DOC_TYPES, '6mb'), async (req, res) => {
+  if (req.customer.kycStatus === 'approved') return res.status(400).json({ error: 'Your account is already verified.' });
+  const f = await saveFile(req, res, { kind: 'kyc', types: DOC_TYPES, customerId: req.customer.id, maxMb: 5 });
+  if (f) res.status(201).json({ id: f.id });
+});
+
+r.post('/kyc', async (req, res) => {
+  const c = req.customer;
+  if (c.kycStatus === 'approved') return res.status(400).json({ error: 'Your account is already verified.' });
+  if (c.kycStatus === 'pending') return res.status(400).json({ error: 'Your documents are already being reviewed.' });
+  const b = req.body || {};
+  const idType = clean(b.idType, 60);
+  const idNumber = clean(b.idNumber, 40);
+  const errors = [];
+  if (!KYC_ID_TYPES.includes(idType)) errors.push('Choose the type of ID.');
+  if (idNumber.length < 4) errors.push('Enter the ID number.');
+  const own = async id => id && (await prisma.storedFile.findFirst({ where: { id: String(id), customerId: c.id, kind: 'kyc' } }));
+  const doc = await own(b.documentId);
+  const extra = b.extraId ? await own(b.extraId) : null;
+  if (!doc) errors.push('Upload a photo or scan of the ID.');
+  if (b.extraId && !extra) errors.push('The second document did not upload. Please try again.');
+  if (errors.length) return res.status(400).json({ errors });
+  // replace any earlier (rejected) documents
+  for (const old of [c.kycDocId, c.kycExtraId]) if (old && old !== doc.id && old !== extra?.id) await removeFile(old);
+  const updated = await prisma.customer.update({
+    where: { id: c.id },
+    data: { kycStatus: 'pending', kycIdType: idType, kycIdNumber: idNumber, kycDocId: doc.id, kycExtraId: extra?.id || null, kycNote: null, kycSubmittedAt: new Date(), kycReviewedAt: null },
+  });
+  kycSubmittedAlert(updated);
+  res.json(kycOut(updated));
+});
+
+/* ---------- messages from Farmora ---------- */
+r.get('/notices', async (req, res) => {
+  const list = await prisma.customerNotice.findMany({ where: { customerId: req.customer.id }, orderBy: { createdAt: 'desc' }, take: 50 });
+  res.json(list.map(n => ({ id: n.id, title: n.title, body: n.body, link: n.link, read: Boolean(n.readAt), at: n.createdAt })));
+});
+
+r.post('/notices/read', async (req, res) => {
+  const ids = Array.isArray(req.body?.ids) ? req.body.ids.map(String).slice(0, 100) : null;
+  await prisma.customerNotice.updateMany({
+    where: { customerId: req.customer.id, ...(ids ? { id: { in: ids } } : {}), OR: [{ readAt: null }, { readAt: { isSet: false } }] },
+    data: { readAt: new Date() },
+  });
   res.json({ ok: true });
 });
 

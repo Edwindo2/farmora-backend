@@ -5,6 +5,7 @@ import { orderReceivedEmail, newOrderAlert } from '../mailer.js';
 import { confirmTransaction, paymentsEnabled } from '../flutterwave.js';
 import { getSite, getFaqGroups, getFx } from '../settings.js';
 import { requireCustomer, optionalCustomer } from '../auth.js';
+import { sendFile } from '../files.js';
 
 const r = Router();
 // Price tier of the signed-in customer: approved distributors and wholesale accounts get their own prices.
@@ -205,6 +206,9 @@ r.post('/orders', requireCustomer, async (req, res) => {
   res.status(201).json({ id: order.reference, reference: order.reference, subtotal: toMajor(subtotal), currency, quoteNeeded });
 });
 
+// Profile photos (public: the id is unguessable).
+r.get('/avatars/:id', (req, res) => sendFile(res, req.params.id, { kind: 'avatar' }));
+
 // Public order tracking: needs the reference and the email used on the order.
 r.get('/orders/track', async (req, res) => {
   const reference = str(req.query.reference, 20).toUpperCase();
@@ -229,8 +233,10 @@ r.get('/orders/track', async (req, res) => {
     quoteNeeded: order.quoteNeeded,
     paymentStatus: order.paymentStatus,
     trackingNumber: order.trackingNumber,
+    currentLocation: order.currentLocation,
+    locationUpdatedAt: order.locationUpdatedAt,
     items: order.items.map(i => ({ name: i.productName, size: i.variantLabel, qty: i.quantity, lineTotal: toMajor(i.lineTotal) })),
-    events: order.events.map(e => ({ status: e.status, note: e.note, at: e.createdAt })),
+    events: order.events.map(e => ({ status: e.status, note: e.note, location: e.location, at: e.createdAt })),
   });
 });
 
