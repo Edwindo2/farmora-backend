@@ -105,6 +105,8 @@ model Order {
   status         String    @default("received") // received | confirmed | paid | processing | shipped | delivered | cancelled
   paymentMethod  String?
   paymentStatus  String    @default("unpaid") // unpaid | paid | refunded
+  paymentRef     String? // Flutterwave transaction id when paid online
+  paidAt         DateTime?
   trackingNumber String?
   neededBy       DateTime?
   notes          String? // from the customer

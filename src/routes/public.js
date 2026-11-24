@@ -2,6 +2,7 @@ import { Router } from 'express';
 import { prisma, makeReference, toMajor } from '../db.js';
 import { CONTACT_TOPICS, SHIPPING_METHODS, STATUS_TEXT } from '../constants.js';
 import { orderReceivedEmail, newOrderAlert } from '../mailer.js';
+import { confirmTransaction, paymentsEnabled } from '../flutterwave.js';
 import { getSite, getFaqGroups, getFx } from '../settings.js';
 import { requireCustomer, optionalCustomer } from '../auth.js';
 
@@ -93,6 +94,19 @@ r.get('/products/:slug', optionalCustomer, async (req, res) => {
   });
 });
 
+const MIN_QTY = 5; // minimum order: 5 packs, gallons or drums of each pack size
+
+// Flutterwave tells us about payments here. The "verif-hash" header must match FLW_SECRET_HASH,
+// and the transaction is checked with Flutterwave before anything is marked paid.
+r.post('/payments/flutterwave/webhook', async (req, res) => {
+  if (!paymentsEnabled() || !process.env.FLW_SECRET_HASH || req.get('verif-hash') !== process.env.FLW_SECRET_HASH) return res.status(401).end();
+  const id = req.body?.data?.id;
+  if (id) {
+    try { await confirmTransaction(id); } catch (err) { console.error('Flutterwave webhook:', err.message); }
+  }
+  res.status(200).end();
+});
+
 // Place an order. Customers must be signed in, so every order shows in their dashboard.
 r.post('/orders', requireCustomer, async (req, res) => {
   const { customer: form = {}, delivery = {}, items = [], notes = '', payment = '', neededBy = '' } = req.body || {};
@@ -127,8 +141,11 @@ r.post('/orders', requireCustomer, async (req, res) => {
       include: { product: true },
     });
     const qty = Number.parseInt(item.qty, 10);
-    if (!variant || !(qty > 0 && qty <= 1000)) return res.status(400).json({ errors: ['One of the items is no longer available.'] });
-    const unit = unitPrice(variant, tierOf(req.customer), local);
+    if (!variant) return res.status(400).json({ errors: ['One of the items is no longer available.'] });
+    if (!(qty >= MIN_QTY && qty <= 100000)) return res.status(400).json({ errors: [`The minimum order is ${MIN_QTY} of each pack size (${variant.label}).`] });
+    // prices are only shown to approved distributors and wholesale accounts; everyone else gets a quote
+    const tier = tierOf(req.customer);
+    const unit = tier ? unitPrice(variant, tier, local) : null;
     lines.push({
       variantId: variant.id,
       productName: variant.product.name,

@@ -16,7 +16,7 @@ export const NEXT_STATUS = {
 // Customer-facing wording for each status (tracking page and status history).
 export const STATUS_TEXT = {
   received: 'We have received your order and are checking stock.',
-  confirmed: 'Your order is confirmed. Payment details have been sent to your email.',
+  confirmed: 'Your order is confirmed with the final price and delivery cost. You can now pay from your dashboard.',
   paid: 'Payment received. Thank you!',
   processing: 'Your oil is being packed and prepared for dispatch.',
   shipped: 'Your order is on its way.',

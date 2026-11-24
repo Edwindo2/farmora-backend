@@ -71,7 +71,8 @@ const pct = (now, before) => (before ? Math.round(((now - before) / before) * 10
 r.get('/stats', async (_req, res) => {
   const now = Date.now();
   const d30 = new Date(now - 30 * DAY), d60 = new Date(now - 60 * DAY);
-  const [byStatus, newMessages, customers, paid, paid30, paidPrev, orders30, ordersPrev, recent, items, recentOrders, topRaw] = await Promise.all([
+  const [pendingApplications, byStatus, newMessages, customers, paid, paid30, paidPrev, orders30, ordersPrev, recent, items, recentOrders, topRaw] = await Promise.all([
+    prisma.customer.count({ where: { wholesaleStatus: 'pending' } }),
     prisma.order.groupBy({ by: ['status'], _count: true }),
     prisma.contactMessage.count({ where: { status: 'new' } }),
     prisma.customer.count(),
@@ -120,6 +121,7 @@ r.get('/stats', async (_req, res) => {
     open: counts.received + counts.confirmed + counts.paid + counts.processing,
     newMessages,
     customers,
+    pendingApplications,
     revenue: { NGN: sum(paid, 'NGN'), USD: sum(paid, 'USD') },
     trend: {
       NGN: pct(sum(paid30, 'NGN'), sum(paidPrev, 'NGN')),
@@ -137,16 +139,20 @@ r.get('/stats', async (_req, res) => {
 
 // Notifications + activity for the right-hand panel.
 r.get('/feed', async (_req, res) => {
-  const [orders, messages, events, customers] = await Promise.all([
+  const [orders, messages, events, customers, applications, payments] = await Promise.all([
     prisma.order.findMany({ orderBy: { createdAt: 'desc' }, take: 5, include: { customer: true } }),
     prisma.contactMessage.findMany({ orderBy: { createdAt: 'desc' }, take: 5 }),
     prisma.orderStatusEvent.findMany({ where: { createdBy: { not: 'customer' } }, orderBy: { createdAt: 'desc' }, take: 6, include: { order: { select: { reference: true } } } }),
     prisma.customer.findMany({ orderBy: { updatedAt: 'desc' }, take: 5 }),
+    prisma.customer.findMany({ where: { wholesaleStatus: 'pending' }, orderBy: { createdAt: 'desc' }, take: 5 }),
+    prisma.order.findMany({ where: { paymentStatus: 'paid', paidAt: { not: null } }, orderBy: { paidAt: 'desc' }, take: 5, include: { customer: true } }),
   ]);
   const notifications = [
     ...orders.map(o => ({ type: 'order', text: `New order ${o.reference} from ${o.customer.name}`, link: `/orders/${o.reference}`, at: o.createdAt })),
-    ...messages.map(m => ({ type: 'message', text: `${m.status === 'new' ? 'New message' : 'Message'} from ${m.name}: ${m.topic}`, link: '/admin/messages', at: m.createdAt })),
-  ].sort((a, b) => b.at - a.at).slice(0, 5);
+    ...messages.map(m => ({ type: 'message', text: `${m.status === 'new' ? 'New message' : 'Message'} from ${m.name}: ${m.topic}`, link: '/messages', at: m.createdAt })),
+    ...applications.map(c => ({ type: 'customers', text: `${c.accountType === 'distributor' ? 'Distributor' : 'Wholesale'} application from ${c.company || c.name}`, link: '/customers', at: c.createdAt, action: true })),
+    ...payments.map(o => ({ type: 'wallet', text: `Payment received for ${o.reference} from ${o.customer.name}`, link: `/orders/${o.reference}`, at: o.paidAt })),
+  ].sort((a, b) => b.at - a.at).slice(0, 8);
   res.json({
     notifications,
     activities: events.map(e => ({ text: `${e.order.reference} marked ${e.status}`, by: e.createdBy, link: `/orders/${e.order.reference}`, at: e.createdAt })),

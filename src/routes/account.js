@@ -5,6 +5,7 @@ import { prisma, toMajor } from '../db.js';
 import { STATUS_TEXT } from '../constants.js';
 import { asset, packImage } from './public.js';
 import { setCustomerSession, clearCustomerSession, requireCustomer, linkLimiter, loginLimiter, customerToken, isAppClient } from '../auth.js';
+import { canPay, createPaymentLink, confirmTransaction, paymentsEnabled } from '../flutterwave.js';
 import { customerLoginEmail, customerActivateEmail, newWholesaleAlert, appUrl } from '../mailer.js';
 
 // Customer accounts and dashboard. Customers register with a password (or use a one-time email link),
@@ -82,7 +83,6 @@ r.post('/register', loginLimiter, async (req, res) => {
   const country = clean(b.country, 80) || (accountType === 'international' ? '' : 'Nigeria');
   if (!country) errors.push('Country is required.');
   if (accountType === 'international' && /^nigeria$/i.test(country)) errors.push('International accounts are for buyers outside Nigeria. Choose Wholesale instead.');
-  if (accountType === 'distributor' && !clean(b.company)) errors.push('Business name is required for distributors.');
   if (accountType === 'distributor' && !clean(b.area)) errors.push('Tell us the states or areas you will cover.');
   if (errors.length) return res.status(400).json({ errors });
 
@@ -201,6 +201,9 @@ r.get('/orders/:reference', async (req, res) => {
     deliveryFee: toMajor(o.deliveryFee),
     paymentMethod: o.paymentMethod,
     paymentStatus: o.paymentStatus,
+    paidAt: o.paidAt,
+    canPay: canPay(o),
+    payOnline: paymentsEnabled(),
     trackingNumber: o.trackingNumber,
     port: o.port,
     address: o.address,
@@ -217,6 +220,29 @@ r.get('/orders/:reference', async (req, res) => {
     })),
     events: o.events.map(e => ({ status: e.status, note: e.note, at: e.createdAt })),
   });
+});
+
+// Pay a confirmed order online: returns the Flutterwave checkout link.
+r.post('/orders/:reference/pay', async (req, res) => {
+  const o = await prisma.order.findFirst({ where: { reference: String(req.params.reference).toUpperCase(), customerId: req.customer.id } });
+  if (!o) return res.status(404).json({ error: 'Order not found.' });
+  if (!canPay(o)) return res.status(400).json({ error: o.paymentStatus === 'paid' ? 'This order is already paid.' : 'This order can be paid once we have confirmed the final price and delivery cost.' });
+  if (!paymentsEnabled()) return res.status(503).json({ error: 'Online payment is not switched on yet. Please pay by bank transfer using the details we emailed you, or contact us.' });
+  try { res.json({ link: await createPaymentLink(o, req.customer) }); }
+  catch (err) { console.error('Flutterwave payment link:', err.message); res.status(502).json({ error: 'We could not start the payment. Please try again in a moment.' }); }
+});
+
+// Back from Flutterwave checkout: check the transaction and mark the order paid if it went through.
+r.post('/orders/:reference/verify-payment', async (req, res) => {
+  const o = await prisma.order.findFirst({ where: { reference: String(req.params.reference).toUpperCase(), customerId: req.customer.id } });
+  if (!o) return res.status(404).json({ error: 'Order not found.' });
+  if (o.paymentStatus === 'paid') return res.json({ paid: true });
+  const id = String(req.body?.transactionId || '');
+  if (!id || !paymentsEnabled()) return res.json({ paid: false });
+  try {
+    const result = await confirmTransaction(id);
+    res.json({ paid: Boolean(result.ok && result.order?.reference === o.reference), message: result.reason });
+  } catch (err) { console.error('Flutterwave verify:', err.message); res.json({ paid: false, message: 'We could not confirm the payment yet. If you were charged, it will update shortly.' }); }
 });
 
 // Update name, phone and company.
