@@ -8,7 +8,7 @@ import { passwordResetEmail, orderStatusEmail, wholesaleStatusEmail, kycStatusEm
 import { sendFile, avatarUrl, kycStatusOf } from '../files.js';
 import { prisma, toMajor, toMinor } from '../db.js';
 import { requireAdmin, setSession, clearSession, loginLimiter } from '../auth.js';
-import { getSite, saveSite, getFx, saveFx, FX_CODES } from '../settings.js';
+import { getSite, saveSite, getFx, saveFx, FX_CODES, getBank, saveBank } from '../settings.js';
 import { NEXT_STATUS, ORDER_STATUSES, PAYMENT_STATUSES, MESSAGE_STATUSES, STATUS_TEXT } from '../constants.js';
 
 const r = Router();
@@ -142,7 +142,7 @@ r.get('/stats', async (_req, res) => {
 
 // Notifications + activity for the right-hand panel.
 r.get('/feed', async (_req, res) => {
-  const [orders, messages, events, customers, applications, payments, kyc] = await Promise.all([
+  const [orders, messages, events, customers, applications, payments, kyc, transfers] = await Promise.all([
     prisma.order.findMany({ orderBy: { createdAt: 'desc' }, take: 5, include: { customer: true } }),
     prisma.contactMessage.findMany({ orderBy: { createdAt: 'desc' }, take: 5 }),
     prisma.orderStatusEvent.findMany({ where: { createdBy: { not: 'customer' } }, orderBy: { createdAt: 'desc' }, take: 6, include: { order: { select: { reference: true } } } }),
@@ -150,11 +150,13 @@ r.get('/feed', async (_req, res) => {
     prisma.customer.findMany({ where: { wholesaleStatus: 'pending' }, orderBy: { createdAt: 'desc' }, take: 5 }),
     prisma.order.findMany({ where: { paymentStatus: 'paid', paidAt: { not: null } }, orderBy: { paidAt: 'desc' }, take: 5, include: { customer: true } }),
     prisma.customer.findMany({ where: { kycStatus: 'pending' }, orderBy: { kycSubmittedAt: 'desc' }, take: 5 }),
+    prisma.order.findMany({ where: { paymentStatus: 'unpaid', transferSentAt: { not: null } }, orderBy: { transferSentAt: 'desc' }, take: 5, include: { customer: true } }),
   ]);
   const notifications = [
     ...orders.map(o => ({ type: 'order', text: `New order ${o.reference} from ${o.customer.name}`, link: `/orders/${o.reference}`, at: o.createdAt })),
     ...messages.map(m => ({ type: 'message', text: `${m.status === 'new' ? 'New message' : 'Message'} from ${m.name}: ${m.topic}`, link: '/messages', at: m.createdAt })),
     ...applications.map(c => ({ type: 'customers', text: `${c.accountType === 'distributor' ? 'Distributor' : 'Wholesale'} application from ${c.company || c.name}`, link: '/customers', at: c.createdAt, action: true })),
+    ...transfers.map(o => ({ type: 'wallet', text: `${o.customer.name} says they paid ${o.reference} by bank transfer. Check and mark paid`, link: `/orders/${o.reference}`, at: o.transferSentAt, action: true })),
     ...kyc.map(c => ({ type: 'kyc', text: `KYC documents from ${c.company || c.name} to review`, link: '/kyc', at: c.kycSubmittedAt, action: true })),
     ...payments.map(o => ({ type: 'wallet', text: `Payment received for ${o.reference} from ${o.customer.name}`, link: `/orders/${o.reference}`, at: o.paidAt })),
   ].sort((a, b) => b.at - a.at).slice(0, 8);
@@ -212,7 +214,7 @@ async function orderDetail(reference) {
     country: o.country, state: o.state, city: o.city, address: o.address, port: o.port, shippingMethod: o.shippingMethod,
     subtotal: toMajor(o.subtotal), deliveryFee: toMajor(o.deliveryFee), total: toMajor(o.total),
     paymentMethod: o.paymentMethod, trackingNumber: o.trackingNumber, neededBy: o.neededBy,
-    currentLocation: o.currentLocation, locationUpdatedAt: o.locationUpdatedAt,
+    currentLocation: o.currentLocation, locationUpdatedAt: o.locationUpdatedAt, transferSentAt: o.transferSentAt, paidAt: o.paidAt,
     notes: o.notes, adminNotes: o.adminNotes,
     next: NEXT_STATUS[o.status],
     items: o.items.map(i => ({ id: i.id, name: i.productName, size: i.variantLabel, qty: i.quantity, unitPrice: toMajor(i.unitPrice), lineTotal: toMajor(i.lineTotal) })),
@@ -289,6 +291,7 @@ r.patch('/orders/:reference', async (req, res) => {
   }
   if (moved && events[0]) { events[0].location = location; if (data.status) events[0].public = true; }
 
+  if (data.paymentStatus === 'paid' && order.paymentStatus !== 'paid' && !order.paidAt) data.paidAt = new Date();
   const updated = await prisma.order.update({ where: { id: order.id }, data: { ...data, events: { create: events } }, include: { customer: true } });
   const shared = events.find(e => e.public);
   if (shared) orderStatusEmail(updated, updated.customer, shared.status, shared.note);
@@ -624,6 +627,14 @@ r.delete('/broadcasts/:id', async (req, res) => {
   await prisma.customerNotice.deleteMany({ where: { broadcastId: req.params.id } });
   await prisma.broadcast.delete({ where: { id: req.params.id } }).catch(() => null);
   res.json({ ok: true });
+});
+
+/* ---------- bank transfer details ---------- */
+r.get('/bank', async (_req, res) => res.json(await getBank()));
+r.put('/bank', async (req, res) => {
+  const out = await saveBank(req.body);
+  if (out.errors) return res.status(400).json({ errors: out.errors });
+  res.json(out.bank);
 });
 
 /* ---------- display currencies ---------- */

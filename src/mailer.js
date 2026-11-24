@@ -190,3 +190,13 @@ export function noticeEmail(customer, title, body) {
     button: { label: 'Open my dashboard', href: appUrl('/account') },
   });
 }
+
+export function transferReportedAlert(order, customer, payer) {
+  return sendMail({
+    to: process.env.ADMIN_NOTIFY_EMAIL,
+    subject: `Bank transfer reported for ${order.reference}`,
+    heading: 'Customer says they have paid',
+    body: `<p><b>${esc(customer.name)}</b>${customer.company ? ` (${esc(customer.company)})` : ''} says they paid <b>${money(order.total, order.currency)}</b> for order <b>${esc(order.reference)}</b> by bank transfer.${payer ? `<br>Paid from: ${esc(payer)}` : ''}</p><p>Check your bank account, then mark the order as paid in the admin.</p>`,
+    button: { label: 'Open the order', href: adminUrl(`/orders/${order.reference}`) },
+  });
+}

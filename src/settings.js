@@ -95,3 +95,43 @@ export async function saveFx(body = {}) {
   fxCache = { rates, updatedAt: row.updatedAt };
   return fxCache;
 }
+
+/* ---------- bank transfer details ---------- */
+// Kept apart from the public site settings: only shown to a signed-in customer whose order is ready to pay.
+export const BANK_FIELDS = {
+  bankName: 60, accountName: 100, accountNumber: 20, // Naira account
+  usdBankName: 60, usdAccountName: 100, usdAccountNumber: 34, usdSwift: 20, // optional dollar (domiciliary) account
+  note: 400, // extra instructions shown to the customer
+};
+let bankCache = null;
+
+export async function getBank() {
+  if (bankCache) return bankCache;
+  const row = await prisma.setting.findUnique({ where: { key: 'bank' } });
+  let saved = {};
+  try { saved = row ? JSON.parse(row.value) : {}; } catch { /* corrupt row */ }
+  bankCache = Object.fromEntries(Object.keys(BANK_FIELDS).map(k => [k, saved[k] || '']));
+  return bankCache;
+}
+
+export async function saveBank(body = {}) {
+  const next = { ...(await getBank()) };
+  for (const [k, max] of Object.entries(BANK_FIELDS)) if (body[k] !== undefined) next[k] = String(body[k] ?? '').trim().slice(0, max);
+  const errors = [];
+  const ngn = [next.bankName, next.accountName, next.accountNumber];
+  if (ngn.some(Boolean) && !ngn.every(Boolean)) errors.push('Fill in the bank name, account name and account number for the Naira account.');
+  if (next.accountNumber && !/^\d{10}$/.test(next.accountNumber)) errors.push('A Nigerian account number (NUBAN) has 10 digits.');
+  const usd = [next.usdBankName, next.usdAccountName, next.usdAccountNumber];
+  if (usd.some(Boolean) && !usd.every(Boolean)) errors.push('Fill in the bank name, account name and account number for the dollar account, or leave all three empty.');
+  if (errors.length) return { errors };
+  await prisma.setting.upsert({ where: { key: 'bank' }, update: { value: JSON.stringify(next) }, create: { key: 'bank', value: JSON.stringify(next) } });
+  bankCache = next;
+  return { bank: next };
+}
+
+// The account to show for an order's currency, or null if none is set up.
+export async function bankFor(currency) {
+  const b = await getBank();
+  if (currency === 'USD') return b.usdAccountNumber ? { bankName: b.usdBankName, accountName: b.usdAccountName, accountNumber: b.usdAccountNumber, swift: b.usdSwift, note: b.note, currency: 'USD' } : null;
+  return b.accountNumber ? { bankName: b.bankName, accountName: b.accountName, accountNumber: b.accountNumber, note: b.note, currency: 'NGN' } : null;
+}

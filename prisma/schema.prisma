@@ -119,6 +119,7 @@ model Order {
   paymentStatus     String    @default("unpaid") // unpaid | paid | refunded
   paymentRef        String? // Flutterwave transaction id when paid online
   paidAt            DateTime?
+  transferSentAt    DateTime? // customer said they paid by bank transfer (admin then checks and marks paid)
   trackingNumber    String?
   currentLocation   String? // where the goods are now, updated by admin
   locationUpdatedAt DateTime?

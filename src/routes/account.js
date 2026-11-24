@@ -6,7 +6,8 @@ import { STATUS_TEXT } from '../constants.js';
 import { asset, packImage } from './public.js';
 import { setCustomerSession, clearCustomerSession, requireCustomer, linkLimiter, loginLimiter, customerToken, isAppClient } from '../auth.js';
 import { canPay, createPaymentLink, confirmTransaction, paymentsEnabled } from '../flutterwave.js';
-import { customerLoginEmail, customerActivateEmail, newWholesaleAlert, kycSubmittedAlert, appUrl } from '../mailer.js';
+import { customerLoginEmail, customerActivateEmail, newWholesaleAlert, kycSubmittedAlert, transferReportedAlert, appUrl } from '../mailer.js';
+import { bankFor } from '../settings.js';
 import { rawUpload, saveFile, removeFile, avatarUrl, IMAGE_TYPES, DOC_TYPES, KYC_ID_TYPES, kycStatusOf } from '../files.js';
 
 // Customer accounts and dashboard. Customers register with a password (or use a one-time email link),
@@ -211,6 +212,9 @@ r.get('/orders/:reference', async (req, res) => {
     paidAt: o.paidAt,
     canPay: canPay(o),
     payOnline: paymentsEnabled(),
+    // bank details only once the order is confirmed and waiting for payment
+    bank: canPay(o) ? await bankFor(o.currency) : null,
+    transferSentAt: o.transferSentAt,
     trackingNumber: o.trackingNumber,
     port: o.port,
     address: o.address,
@@ -237,6 +241,23 @@ r.post('/orders/:reference/pay', async (req, res) => {
   if (!paymentsEnabled()) return res.status(503).json({ error: 'Online payment is not switched on yet. Please pay by bank transfer using the details we emailed you, or contact us.' });
   try { res.json({ link: await createPaymentLink(o, req.customer) }); }
   catch (err) { console.error('Flutterwave payment link:', err.message); res.status(502).json({ error: 'We could not start the payment. Please try again in a moment.' }); }
+});
+
+// The customer says they've paid by bank transfer. We note it and alert the admin, who checks and marks it paid.
+r.post('/orders/:reference/transfer-sent', async (req, res) => {
+  const o = await prisma.order.findFirst({ where: { reference: String(req.params.reference).toUpperCase(), customerId: req.customer.id } });
+  if (!o) return res.status(404).json({ error: 'Order not found.' });
+  if (!canPay(o)) return res.status(400).json({ error: o.paymentStatus === 'paid' ? 'This order is already paid.' : 'This order is not ready for payment yet.' });
+  const payer = clean(req.body?.payer, 120);
+  const updated = await prisma.order.update({
+    where: { id: o.id },
+    data: {
+      transferSentAt: new Date(), paymentMethod: 'Bank transfer',
+      events: { create: { status: o.status, note: `You told us you paid by bank transfer${payer ? ` from ${payer}` : ''}. We'll confirm as soon as it arrives.`, public: true, createdBy: 'customer' } },
+    },
+  });
+  transferReportedAlert(updated, req.customer, payer);
+  res.json({ ok: true, transferSentAt: updated.transferSentAt });
 });
 
 // Back from Flutterwave checkout: check the transaction and mark the order paid if it went through.
