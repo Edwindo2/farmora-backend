@@ -33,20 +33,22 @@ model Product {
 
 /// A pack size of a product, e.g. "5 litres" or "20ft container", with its own prices and stock.
 model ProductVariant {
-  id           String      @id @default(cuid()) @map("_id")
-  product      Product     @relation(fields: [productId], references: [id], onDelete: Cascade)
-  productId    String
-  code         String // short code used by the storefront, e.g. "5l", "drum"
-  label        String
-  sku          String      @unique
-  priceNgn     Int? // kobo; null = price on request
-  priceUsd     Int? // cents; null = price on request
-  wholesaleNgn Int? // kobo; price for approved wholesale accounts (null = use the normal price)
-  wholesaleUsd Int? // cents
-  stock        Int? // units on hand; null = not tracked
-  active       Boolean     @default(true)
-  sortOrder    Int         @default(0)
-  orderItems   OrderItem[]
+  id             String      @id @default(cuid()) @map("_id")
+  product        Product     @relation(fields: [productId], references: [id], onDelete: Cascade)
+  productId      String
+  code           String // short code used by the storefront, e.g. "5l", "drum"
+  label          String
+  sku            String      @unique
+  priceNgn       Int? // kobo; null = price on request
+  priceUsd       Int? // cents; null = price on request
+  wholesaleNgn   Int? // kobo; price for approved wholesale accounts (null = use the normal price)
+  wholesaleUsd   Int? // cents
+  distributorNgn Int? // kobo; price for approved distributors (null = use the wholesale price)
+  distributorUsd Int? // cents
+  stock          Int? // units on hand; null = not tracked
+  active         Boolean     @default(true)
+  sortOrder      Int         @default(0)
+  orderItems     OrderItem[]
 
   @@unique([productId, code])
 }
@@ -62,8 +64,10 @@ model Customer {
   country             String?
   passwordHash        String? // set when the customer registers; null for guest-only customers
   pendingPasswordHash String? // chosen at registration, activated once the email is confirmed
-  accountType         String               @default("individual") // individual | wholesale | international
-  wholesaleStatus     String               @default("none") // none | pending | approved | rejected
+  accountType         String               @default("individual") // individual | wholesale | distributor | international
+  wholesaleStatus     String               @default("none") // none | pending | approved | rejected (wholesale and distributor approval)
+  area                String? // distributors: the states / areas they cover
+  monthlyVolume       String? // distributors: expected monthly volume, in their words
   wishlist            WishlistItem[]
   lastLoginAt         DateTime?
   orders              Order[]

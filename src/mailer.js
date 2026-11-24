@@ -131,24 +131,28 @@ export function customerActivateEmail(customer, link) {
 }
 
 export function newWholesaleAlert(customer, note = '') {
+  const kind = customer.accountType === 'distributor' ? 'distributor' : 'wholesale';
+  const extra = kind === 'distributor' ? `<p>Areas covered: ${esc(customer.area || '-')}<br>Expected monthly volume: ${esc(customer.monthlyVolume || '-')}</p>` : '';
   return sendMail({
     to: process.env.ADMIN_NOTIFY_EMAIL,
-    subject: `Wholesale account request from ${customer.company || customer.name}`,
-    heading: 'New wholesale request',
-    body: `<p><b>${esc(customer.name)}</b>${customer.company ? ` (${esc(customer.company)})` : ''}, ${esc(customer.email)}, ${esc(customer.phone || '')}, ${esc(customer.country || '')} asked for a wholesale account.</p>${note ? `<p>${esc(note)}</p>` : ''}`,
+    subject: `${kind === 'distributor' ? 'Distributor application' : 'Wholesale account request'} from ${customer.company || customer.name}`,
+    heading: kind === 'distributor' ? 'New distributor application' : 'New wholesale request',
+    body: `<p><b>${esc(customer.name)}</b>${customer.company ? ` (${esc(customer.company)})` : ''}, ${esc(customer.email)}, ${esc(customer.phone || '')}, ${esc(customer.country || '')} asked for a ${kind} account.</p>${extra}${note ? `<p>${esc(note)}</p>` : ''}`,
     button: { label: 'Review in admin', href: adminUrl('/customers') },
   });
 }
 
 export function wholesaleStatusEmail(customer, status) {
   const approved = status === 'approved';
+  const kind = customer.accountType === 'distributor' ? 'distributor' : 'wholesale';
+  const first = esc(customer.name.split(' ')[0]);
   return sendMail({
     to: customer.email,
-    subject: approved ? 'Your Farmora wholesale account is approved' : 'Your Farmora wholesale request',
-    heading: approved ? 'Wholesale prices unlocked.' : 'About your wholesale request',
+    subject: approved ? `Your Farmora ${kind} account is approved` : `Your Farmora ${kind} application`,
+    heading: approved ? (kind === 'distributor' ? 'Welcome, Farmora distributor.' : 'Wholesale prices unlocked.') : `About your ${kind} application`,
     body: approved
-      ? `<p>Hi ${esc(customer.name.split(' ')[0])}, your wholesale account is approved. Sign in to see wholesale prices on our products and order in bulk.</p>`
-      : `<p>Hi ${esc(customer.name.split(' ')[0])}, we couldn't approve a wholesale account for you at the moment. You can still order at our normal prices, or reply to this email to tell us more about your business.</p>`,
-    button: { label: approved ? 'Shop wholesale' : 'Visit the shop', href: appUrl('/shop') },
+      ? `<p>Hi ${first}, your ${kind} account is approved. Sign in to see your ${kind} prices on our products and request your bulk orders.</p>`
+      : `<p>Hi ${first}, we couldn't approve your ${kind} application at the moment. Reply to this email to tell us more about your business, or request a bulk quote at any time.</p>`,
+    button: { label: 'See my prices', href: appUrl('/shop') },
   });
 }

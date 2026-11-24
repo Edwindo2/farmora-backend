@@ -78,18 +78,21 @@ r.post('/register', loginLimiter, async (req, res) => {
   if (clean(b.phone, 40).replace(/\D/g, '').length < 7) errors.push('Enter a phone or WhatsApp number.');
   const pwProblem = passwordProblem(b.password);
   if (pwProblem) errors.push(pwProblem);
-  const accountType = ['wholesale', 'international'].includes(b.accountType) ? b.accountType : 'individual';
+  const accountType = ['wholesale', 'distributor', 'international'].includes(b.accountType) ? b.accountType : 'wholesale';
   const country = clean(b.country, 80) || (accountType === 'international' ? '' : 'Nigeria');
   if (!country) errors.push('Country is required.');
   if (accountType === 'international' && /^nigeria$/i.test(country)) errors.push('International accounts are for buyers outside Nigeria. Choose Wholesale instead.');
+  if (accountType === 'distributor' && !clean(b.company)) errors.push('Business name is required for distributors.');
+  if (accountType === 'distributor' && !clean(b.area)) errors.push('Tell us the states or areas you will cover.');
   if (errors.length) return res.status(400).json({ errors });
 
   const company = clean(b.company) || null;
   const data = {
     name: clean(b.name), phone: clean(b.phone, 40), company, country, accountType,
     buyerType: accountType !== 'individual' || company ? 'business' : 'individual',
-    // wholesale accounts start pending until the admin approves them
-    wholesaleStatus: accountType === 'wholesale' ? 'pending' : 'none',
+    // wholesale and distributor accounts start pending until the admin approves them
+    wholesaleStatus: ['wholesale', 'distributor'].includes(accountType) ? 'pending' : 'none',
+    ...(accountType === 'distributor' ? { area: clean(b.area, 200), monthlyVolume: clean(b.monthlyVolume, 120) || null } : {}),
   };
   const existing = await prisma.customer.findUnique({ where: { email } });
   if (existing?.passwordHash) return res.status(409).json({ error: 'An account with this email already exists. Please sign in.' });
@@ -100,7 +103,7 @@ r.post('/register', loginLimiter, async (req, res) => {
     return res.status(202).json({ verify: true });
   }
   const customer = await prisma.customer.create({ data: { ...data, email, passwordHash: await bcrypt.hash(String(b.password), 10), lastLoginAt: new Date() } });
-  if (accountType === 'wholesale') newWholesaleAlert(customer);
+  if (['wholesale', 'distributor'].includes(accountType)) newWholesaleAlert(customer);
   setCustomerSession(res, customer);
   res.status(201).json({ ok: true, ...(isAppClient(req) ? { token: customerToken(customer) } : {}) });
 });
@@ -136,6 +139,8 @@ r.get('/me', async (req, res) => {
     hasPassword: Boolean(c.passwordHash),
     accountType: c.accountType,
     wholesaleStatus: c.wholesaleStatus,
+    area: c.area,
+    monthlyVolume: c.monthlyVolume,
     since: c.createdAt,
     lastDelivery: last && {
       type: last.deliveryType,

@@ -6,7 +6,15 @@ import { getSite, getFaqGroups, getFx } from '../settings.js';
 import { requireCustomer, optionalCustomer } from '../auth.js';
 
 const r = Router();
-const isWholesale = c => c?.accountType === 'wholesale' && c?.wholesaleStatus === 'approved';
+// Price tier of the signed-in customer: approved distributors and wholesale accounts get their own prices.
+const tierOf = c => (c?.wholesaleStatus === 'approved' && ['wholesale', 'distributor'].includes(c.accountType) ? c.accountType : null);
+// Unit price (minor units) for a pack size and tier. Distributor price falls back to wholesale, then the normal price.
+const unitPrice = (v, tier, local) => {
+  const [base, w, d] = local ? [v.priceNgn, v.wholesaleNgn, v.distributorNgn] : [v.priceUsd, v.wholesaleUsd, v.distributorUsd];
+  if (tier === 'distributor') return d ?? w ?? base;
+  if (tier === 'wholesale') return w ?? base;
+  return base;
+};
 // Full URL for an image path when PUBLIC_URL is set (needed by mobile apps); relative paths otherwise.
 export const asset = p => (p && p.startsWith('/') && process.env.PUBLIC_URL ? `${process.env.PUBLIC_URL.replace(/\/$/, '')}${p}` : p || null);
 
@@ -22,14 +30,15 @@ export function packImage(product, label) {
   return product.image || '/home/pack-25l.jpg';
 }
 
-// Storefront shape for a pack size. Approved wholesale accounts get wholesale prices where they're set.
-const sizeOut = (v, wholesale, product) => ({
+// Storefront shape for a pack size. Approved distributors and wholesale accounts get their own prices where set;
+// `tier` tells the storefront that the price shown is theirs (prices are hidden from everyone else).
+const sizeOut = (v, tier, product) => ({
   id: v.code,
   label: v.label,
   image: asset(packImage(product, v.label)),
-  ngn: toMajor(wholesale && v.wholesaleNgn != null ? v.wholesaleNgn : v.priceNgn),
-  usd: toMajor(wholesale && v.wholesaleUsd != null ? v.wholesaleUsd : v.priceUsd),
-  ...(wholesale && (v.wholesaleNgn != null || v.wholesaleUsd != null) ? { retailNgn: toMajor(v.priceNgn), retailUsd: toMajor(v.priceUsd), wholesale: true } : {}),
+  ngn: toMajor(unitPrice(v, tier, true)),
+  usd: toMajor(unitPrice(v, tier, false)),
+  ...(tier ? { tier, retailNgn: toMajor(v.priceNgn), retailUsd: toMajor(v.priceUsd), wholesale: true } : {}),
   inStock: v.stock == null || v.stock > 0,
 });
 const isEmail = v => /^\S+@\S+\.\S+$/.test(String(v || ''));
@@ -66,7 +75,7 @@ r.get('/products', optionalCustomer, async (req, res) => {
       tag: p.tag,
       description: p.description,
       image: asset(p.image),
-      sizes: p.variants.map(v => sizeOut(v, isWholesale(req.customer), p)),
+      sizes: p.variants.map(v => sizeOut(v, tierOf(req.customer), p)),
     })),
   );
 });
@@ -80,7 +89,7 @@ r.get('/products/:slug', optionalCustomer, async (req, res) => {
   if (!p) return res.status(404).json({ error: 'Product not found.' });
   res.json({
     id: p.slug, name: p.name, tag: p.tag, description: p.description, image: asset(p.image),
-    sizes: p.variants.map(v => sizeOut(v, isWholesale(req.customer), p)),
+    sizes: p.variants.map(v => sizeOut(v, tierOf(req.customer), p)),
   });
 });
 
@@ -119,10 +128,7 @@ r.post('/orders', requireCustomer, async (req, res) => {
     });
     const qty = Number.parseInt(item.qty, 10);
     if (!variant || !(qty > 0 && qty <= 1000)) return res.status(400).json({ errors: ['One of the items is no longer available.'] });
-    const ws = isWholesale(req.customer);
-    const unit = local
-      ? (ws && variant.wholesaleNgn != null ? variant.wholesaleNgn : variant.priceNgn)
-      : (ws && variant.wholesaleUsd != null ? variant.wholesaleUsd : variant.priceUsd);
+    const unit = unitPrice(variant, tierOf(req.customer), local);
     lines.push({
       variantId: variant.id,
       productName: variant.product.name,

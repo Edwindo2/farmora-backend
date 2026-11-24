@@ -283,7 +283,7 @@ r.get('/products', async (_req, res) => {
   const products = await prisma.product.findMany({ orderBy: { sortOrder: 'asc' }, include: { variants: { orderBy: { sortOrder: 'asc' } } } });
   res.json(products.map(p => ({
     id: p.id, slug: p.slug, name: p.name, tag: p.tag, description: p.description, active: p.active, image: p.image,
-    variants: p.variants.map(v => ({ id: v.id, code: v.code, label: v.label, sku: v.sku, ngn: toMajor(v.priceNgn), usd: toMajor(v.priceUsd), wholesaleNgn: toMajor(v.wholesaleNgn), wholesaleUsd: toMajor(v.wholesaleUsd), stock: v.stock, active: v.active })),
+    variants: p.variants.map(v => ({ id: v.id, code: v.code, label: v.label, sku: v.sku, ngn: toMajor(v.priceNgn), usd: toMajor(v.priceUsd), wholesaleNgn: toMajor(v.wholesaleNgn), wholesaleUsd: toMajor(v.wholesaleUsd), distributorNgn: toMajor(v.distributorNgn), distributorUsd: toMajor(v.distributorUsd), stock: v.stock, active: v.active })),
   })));
 });
 
@@ -323,9 +323,11 @@ function variantData(body = {}, create = false) {
   if (body.usd !== undefined) data.priceUsd = toMinor(num(body.usd));
   if (body.wholesaleNgn !== undefined) data.wholesaleNgn = toMinor(num(body.wholesaleNgn));
   if (body.wholesaleUsd !== undefined) data.wholesaleUsd = toMinor(num(body.wholesaleUsd));
+  if (body.distributorNgn !== undefined) data.distributorNgn = toMinor(num(body.distributorNgn));
+  if (body.distributorUsd !== undefined) data.distributorUsd = toMinor(num(body.distributorUsd));
   if (body.stock !== undefined) data.stock = num(body.stock) == null ? null : Math.round(num(body.stock));
   if (body.active !== undefined) data.active = Boolean(body.active);
-  for (const k of ['priceNgn', 'priceUsd', 'wholesaleNgn', 'wholesaleUsd', 'stock']) {
+  for (const k of ['priceNgn', 'priceUsd', 'wholesaleNgn', 'wholesaleUsd', 'distributorNgn', 'distributorUsd', 'stock']) {
     if (data[k] != null && (Number.isNaN(data[k]) || data[k] < 0)) errors.push('Prices and stock must be positive numbers.');
   }
   return { data, errors: [...new Set(errors)] };
@@ -372,7 +374,7 @@ r.patch('/variants/:id', async (req, res) => {
   const { data, errors } = variantData(req.body);
   if (errors.length) return res.status(400).json({ error: errors.join(' ') });
   const v = await prisma.productVariant.update({ where: { id: req.params.id }, data });
-  res.json({ id: v.id, label: v.label, ngn: toMajor(v.priceNgn), usd: toMajor(v.priceUsd), wholesaleNgn: toMajor(v.wholesaleNgn), wholesaleUsd: toMajor(v.wholesaleUsd), stock: v.stock, active: v.active });
+  res.json({ id: v.id, label: v.label, ngn: toMajor(v.priceNgn), usd: toMajor(v.priceUsd), wholesaleNgn: toMajor(v.wholesaleNgn), wholesaleUsd: toMajor(v.wholesaleUsd), distributorNgn: toMajor(v.distributorNgn), distributorUsd: toMajor(v.distributorUsd), stock: v.stock, active: v.active });
 });
 
 r.delete('/variants/:id', async (req, res) => {
@@ -497,16 +499,20 @@ r.patch('/messages/:id', async (req, res) => {
 
 r.get('/customers', async (_req, res) => {
   const list = await prisma.customer.findMany({ orderBy: { createdAt: 'desc' }, take: 300, include: { _count: { select: { orders: true } } } });
-  res.json(list.map(c => ({ id: c.id, name: c.name, email: c.email, phone: c.phone, company: c.company, buyerType: c.buyerType, country: c.country, accountType: c.accountType, wholesaleStatus: c.wholesaleStatus, registered: Boolean(c.passwordHash), orders: c._count.orders, createdAt: c.createdAt })));
+  res.json(list.map(c => ({ id: c.id, name: c.name, email: c.email, phone: c.phone, company: c.company, buyerType: c.buyerType, country: c.country, accountType: c.accountType, wholesaleStatus: c.wholesaleStatus, area: c.area, monthlyVolume: c.monthlyVolume, registered: Boolean(c.passwordHash), orders: c._count.orders, createdAt: c.createdAt })));
 });
 
-// Approve or decline a wholesale account. The customer is emailed either way.
+// Approve or decline a wholesale or distributor account. The customer is emailed either way.
 r.patch('/customers/:id', async (req, res) => {
   const status = req.body?.wholesaleStatus;
   if (!['approved', 'rejected', 'none', 'pending'].includes(status)) return res.status(400).json({ error: 'Invalid wholesale status.' });
+  const before = await prisma.customer.findUnique({ where: { id: req.params.id } });
+  if (!before) return res.status(404).json({ error: 'Customer not found.' });
+  // distributors stay distributors when approved; everyone else becomes a wholesale account
+  const accountType = before.accountType === 'distributor' ? 'distributor' : 'wholesale';
   const c = await prisma.customer.update({
     where: { id: req.params.id },
-    data: { wholesaleStatus: status, ...(status === 'approved' ? { accountType: 'wholesale', buyerType: 'business' } : {}) },
+    data: { wholesaleStatus: status, ...(status === 'approved' ? { accountType, buyerType: 'business' } : {}) },
   });
   if (status === 'approved' || status === 'rejected') wholesaleStatusEmail(c, status);
   res.json({ id: c.id, wholesaleStatus: c.wholesaleStatus, accountType: c.accountType });
